@@ -15,6 +15,8 @@ pip install -r requirements.txt
 
 ## Usage
 ```bash
+python main + "path to .xlsx file"
+e.g.:
 python main.py "/Users/jamiethomson/Downloads/Annual Travel Data - 2025.xlsx"
 ```
 

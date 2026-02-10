@@ -47,6 +47,8 @@ class Config:
     distance_col: str = "Distance_km"
     user_agent: str = "perigon-distance-calculator"
     cache_file: str = ".distance_cache.json"
+    only_sheets: Tuple[str, ...] = ()
+    debug_geocode: bool = False
 
 
 def parse_args() -> Config:
@@ -79,6 +81,15 @@ def parse_args() -> Config:
         default=".distance_cache.json",
         help="Path to persistent geocode cache file (default: .distance_cache.json in CWD)",
     )
+    parser.add_argument(
+        "--only-sheets",
+        help="Comma-separated list of sheet names to process (default: all)",
+    )
+    parser.add_argument(
+        "--debug-geocode",
+        action="store_true",
+        help="Print each geocode request/response for tracing (verbose)",
+    )
 
     args = parser.parse_args()
 
@@ -97,21 +108,31 @@ def parse_args() -> Config:
         distance_col=args.distance_col,
         user_agent=args.user_agent,
         cache_file=os.path.abspath(args.cache_file),
+        only_sheets=tuple(s.strip() for s in args.only_sheets.split(",")) if args.only_sheets else (),
+        debug_geocode=args.debug_geocode,
     )
 
 
-def geocode_city(name: Any, geolocator: Nominatim, cache: Dict[str, Tuple[float, float]]):
+def geocode_city(name: Any, geolocator: Nominatim, cache: Dict[str, Tuple[float, float]], debug: bool):
     """Return (lat, lon) for a city name or raise/return None."""
     if not isinstance(name, str) or not name.strip():
         return None
     key = name.strip().lower()
     if key in cache:
+        if debug:
+            print(f"         [cache hit] '{name}' -> {cache[key]}")
         return cache[key]
+    if debug:
+        print(f"         [geocode] '{name}' ...")
     location = geolocator.geocode(name)
     if location is None:
+        if debug:
+            print(f"         [geocode] '{name}' -> None")
         return None
     coords = (location.latitude, location.longitude)
     cache[key] = coords
+    if debug:
+        print(f"         [geocode] '{name}' -> {coords}")
     return coords
 
 
@@ -123,8 +144,8 @@ def compute_distance(row, cfg: Config, geolocator: Nominatim, cache: Dict[str, T
         return ERR_MISSING_VALUE
 
     try:
-        coords1 = geocode_city(start, geolocator, cache)
-        coords2 = geocode_city(dest, geolocator, cache)
+        coords1 = geocode_city(start, geolocator, cache, cfg.debug_geocode)
+        coords2 = geocode_city(dest, geolocator, cache, cfg.debug_geocode)
         if coords1 is None or coords2 is None:
             return ERR_GEOCODE_FAIL
         return round(geodesic(coords1, coords2).kilometers, 3)
@@ -145,6 +166,11 @@ def process_workbook(cfg: Config) -> None:
 
     output_sheets = {}
     for sheet_name, df in sheets.items():
+        if cfg.only_sheets and sheet_name not in cfg.only_sheets:
+            print(f"       Skipped '{sheet_name}' (not in --only-sheets)")
+            output_sheets[sheet_name] = df
+            continue
+
         df_out = df.copy()
         if cfg.start_col in df_out.columns and cfg.dest_col in df_out.columns:
             total_rows = len(df_out)
