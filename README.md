@@ -1,6 +1,6 @@
 # Distance Calculator CLI
 
-Add great-circle travel distances to every worksheet in an Excel workbook using OpenStreetMap (Nominatim) via `geopy`.
+Add great-circle travel distances to every worksheet in an Excel workbook using `geopy`. Supports public Nominatim (not recommended for batches) and OpenCage with an API key.
 
 ## Prerequisites
 - Python 3.9+
@@ -13,11 +13,14 @@ source .venv/bin/activate  # Windows: .venv\\Scripts\\activate
 pip install -r requirements.txt
 ```
 
+Create a `.env` file (already gitignored) and add your OpenCage key if you’ll use that provider:
+```
+OPENCAGE_API_KEY=your_real_key_here
+```
+
 ## Usage
 ```bash
-python main + "path to .xlsx file"
-e.g.:
-python main.py "/Users/jamiethomson/Downloads/Annual Travel Data - 2025.xlsx"
+python main.py "/path/to/Annual Travel Data 2025.xlsx"
 ```
 
 Behavior:
@@ -27,16 +30,25 @@ Behavior:
 - Output is saved beside the input as `New_<original filename>.xlsx`.
 
 ### Optional flags
+- `--provider` choose `opencage` (recommended for batches) or `nominatim` (default; public endpoint can 403).
+- `--api-key` API key for provider (falls back to `OPENCAGE_API_KEY` env var).
 - `--start-col` Override origin column name (default: `Starting`).
 - `--dest-col`  Override destination column name (default: `Destination`).
 - `--distance-col` Output column name (default: `Distance_km`).
 - `--user-agent` Custom Nominatim user agent (default: `perigon-distance-calculator`).
+- `--only-sheets` Comma-separated list of sheet names to process.
+- `--debug-geocode` Verbose geocode logging.
+- `--min-delay`, `--max-retries`, `--error-wait` Tune rate limiting/backoff.
 
 ### Example
 ```bash
-python main.py "./Annual Travel Data - 2025.xlsx"
+# Using OpenCage with key from .env
+python main.py "./Annual Travel Data 2025.xlsx" \
+  --provider opencage \
+  --only-sheets UniqueFlights \
+  --debug-geocode
 ```
 
 ## Notes
-- Be courteous to OpenStreetMap Nominatim usage policy. Heavy runs should add throttling; the script already caches lookups in-memory per run.
+- Public Nominatim is not intended for bulk jobs and may return 403 immediately; use `opencage` with an API key for reliability.
 - The original file is never modified; the new file is written alongside it.
