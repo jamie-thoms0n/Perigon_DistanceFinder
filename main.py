@@ -23,7 +23,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Tuple, Any
+from typing import Any
 
 import pandas as pd
 from geopy.distance import geodesic
@@ -51,7 +51,15 @@ COMMON_CORRECTIONS = {
 }
 
 # Tokens that should be treated as missing and not sent to the geocoder.
-INVALID_TOKENS = {"", ".", "-", "n/a", "na", "nan", "none", "null"}
+INVALID_TOKENS = {"", ".", "-", "n/a", "na", "nan", "none", "null", " "}
+
+
+@dataclass
+class GeocodeBias:
+    label: str
+    kwargs: dict[str, Any]
+    low_threshold_km: float | None = None
+    high_threshold_km: float | None = None
 
 
 @dataclass
@@ -161,9 +169,9 @@ def parse_args() -> Config:
 def geocode_city(
     name: Any,
     geocode_fn,
-    cache: Dict[str, Tuple[float, float]],
+    cache: dict[str, tuple[float, float]],
     debug: bool,
-    geocode_kwargs: Dict[str, Any] | None = None,
+    geocode_kwargs: dict[str, Any] | None = None,
 ):
     """Return (lat, lon) for a city name or raise/return None."""
     if not isinstance(name, str) or not name.strip():
@@ -217,13 +225,13 @@ def compute_distance_pair(
     row,
     cfg: Config,
     geocode_fn,
-    cache: Dict[str, Tuple[float, float]],
-    bias_plan: Tuple[Tuple[str, Dict[str, Any], float | None], ...],
+    cache: dict[str, tuple[float, float]],
+    bias_plan: tuple[GeocodeBias, ...],
 ):
     """
     Try geocoding both endpoints under each bias in order.
-    bias_plan: sequence of (label, geocode_kwargs, high_distance_threshold_or_None)
-    Returns (result, flag)
+    bias_plan: sequence of GeocodeBias entries
+    Returns (result, flag):
       result: distance float or error token
       flag: "" or diagnostic string
     """
@@ -233,17 +241,21 @@ def compute_distance_pair(
     if not isinstance(start, str) or not isinstance(dest, str) or not start.strip() or not dest.strip():
         return ERR_MISSING_VALUE, "MISSING_VALUE"
 
-    for label, kwargs, high_thresh in bias_plan:
-        coords1 = geocode_city(start, geocode_fn, cache, cfg.debug_geocode, kwargs)
-        coords2 = geocode_city(dest, geocode_fn, cache, cfg.debug_geocode, kwargs)
+    for bias in bias_plan:
+        coords1 = geocode_city(start, geocode_fn, cache, cfg.debug_geocode, bias.kwargs)
+        coords2 = geocode_city(dest, geocode_fn, cache, cfg.debug_geocode, bias.kwargs)
         if coords1 and coords2:
             dist = round(geodesic(coords1, coords2).kilometers, 3)
-            if high_thresh and dist > high_thresh:
+            if bias.low_threshold_km and dist < bias.low_threshold_km:
                 if cfg.debug_geocode:
-                    print(f"         [flag {label}] {start}->{dest} = {dist} km exceeds {high_thresh}")
+                    print(f"         [flag {bias.label}] {start}->{dest} = {dist} km below {bias.low_threshold_km}")
+                return dist, "CHECK_DISTANCE_LOW"
+            if bias.high_threshold_km and dist > bias.high_threshold_km:
+                if cfg.debug_geocode:
+                    print(f"         [flag {bias.label}] {start}->{dest} = {dist} km exceeds {bias.high_threshold_km}")
                 return dist, "CHECK_DISTANCE_HIGH"
             if cfg.debug_geocode:
-                print(f"         [distance {label}] {start} -> {dest}: {dist} km")
+                print(f"         [distance {bias.label}] {start} -> {dest}: {dist} km")
             return dist, ""
     return ERR_GEOCODE_FAIL, "GEOCODE_FAIL"
 
@@ -273,11 +285,21 @@ def build_ssl_context():
 
 
 def process_workbook(cfg: Config) -> None:
-    cache: Dict[str, Tuple[float, float]] = load_cache(cfg.cache_file)
+    # Ensure output path directory is writable before heavy work.
+    out_dir = Path(cfg.output_path).parent
+    if not os.access(out_dir, os.W_OK):
+        sys.exit(f"Output directory is not writable: {out_dir}")
+
+    cache: dict[str, tuple[float, float]] = load_cache(cfg.cache_file)
 
     print(f"[1/4] Reading workbook: {cfg.input_path}")
     sheets = pd.read_excel(cfg.input_path, sheet_name=None)
     print(f"[2/4] Loaded {len(sheets)} sheet(s): {', '.join(sheets.keys())}")
+
+    if cfg.only_sheets:
+        missing = [s for s in cfg.only_sheets if s not in sheets]
+        if missing:
+            print(f"Warning: requested --only-sheets not found: {', '.join(missing)}")
 
     geocode_fn = build_geocoder(cfg)
 
@@ -297,16 +319,25 @@ def process_workbook(cfg: Config) -> None:
             proc_rows = len(df_proc)
             print(f"[3/4] Processing sheet '{sheet_name}' with {proc_rows}/{total_rows} row(s){' (debug limited)' if debug_row_limit else ''}")
 
+            if cfg.distance_col in df_out.columns:
+                print(f"Warning: sheet '{sheet_name}' already has column '{cfg.distance_col}', values will be overwritten.")
+
             # Sheet-specific geocode bias and outlier thresholds
-            bias_plan: Tuple[Tuple[str, Dict[str, Any], float | None], ...]
+            bias_plan: tuple[GeocodeBias, ...]
             if sheet_name.lower() == "uniquetrains":
                 bias_plan = (
-                    ("GB", {"country": "gb"}, 800.0),          # UK bias, flag >800km
-                    ("IN", {"country": "in"}, 2000.0),        # India bias, flag >2000km
-                    ("EU", {}, 2000.0),                       # fallback Europe/global, flag >2000km
+                    GeocodeBias("GB", {"country": "gb"}, None, 800.0),
+                    GeocodeBias("IN", {"country": "in"}, None, 2000.0),
+                    GeocodeBias("EU", {}, None, 2000.0),
+                )
+            elif sheet_name.lower() == "uniqueflights":
+                bias_plan = (
+                    GeocodeBias("ANY", {}, 200.0, 8000.0),
+                    GeocodeBias("IN", {"country": "in"}, 200.0, 8000.0),
+                    GeocodeBias("GB", {"country": "gb"}, 200.0, 8000.0),
                 )
             else:
-                bias_plan = (("ANY", {}, None),)
+                bias_plan = (GeocodeBias("ANY", {}, None, None),)
 
             distances = ["DEBUG_SKIPPED" for _ in range(total_rows)] if debug_row_limit else []
             flags = ["DEBUG_SKIPPED" for _ in range(total_rows)] if debug_row_limit else []
@@ -326,7 +357,7 @@ def process_workbook(cfg: Config) -> None:
                 if cfg.debug_geocode:
                     print(f"       [row {idx}] start='{row.get(cfg.start_col)}' dest='{row.get(cfg.dest_col)}' -> {result}")
             df_out[cfg.distance_col] = distances
-            if sheet_name.lower() == "uniquetrains":
+            if sheet_name.lower() in ("uniquetrains", "uniqueflights"):
                 df_out["Distance_flag"] = flags
             print(f"       Done: {sheet_name}")
         else:
@@ -359,7 +390,7 @@ def main():
         print("\nProcess interrupted by user. No output file written.")
 
 
-def load_cache(cache_path: str) -> Dict[str, Tuple[float, float]]:
+def load_cache(cache_path: str) -> dict[str, tuple[float, float]]:
     path = Path(cache_path)
     if not path.exists():
         return {}
@@ -373,7 +404,7 @@ def load_cache(cache_path: str) -> Dict[str, Tuple[float, float]]:
         return {}
 
 
-def save_cache(cache_path: str, cache: Dict[str, Tuple[float, float]]) -> None:
+def save_cache(cache_path: str, cache: dict[str, tuple[float, float]]) -> None:
     try:
         path = Path(cache_path)
         with path.open("w", encoding="utf-8") as f:
