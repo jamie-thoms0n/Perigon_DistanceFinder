@@ -19,7 +19,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import ssl
 import sys
 import time
 from dataclasses import dataclass
@@ -28,16 +27,16 @@ from typing import Dict, Tuple, Any
 
 import pandas as pd
 from geopy.distance import geodesic
-from geopy.geocoders import Nominatim, OpenCage
+from geopy.geocoders import OpenCage
 from geopy.extra.rate_limiter import RateLimiter
 from geopy.exc import GeocoderServiceError, GeocoderTimedOut
 from dotenv import load_dotenv
+import ssl
 
 try:
     import certifi
 except ImportError:
     certifi = None
-
 
 # Error tokens we may write into the distance column
 ERR_MISSING_COLUMNS = "ERROR_MISSING_COLUMNS"
@@ -62,8 +61,7 @@ class Config:
     start_col: str = "Starting"
     dest_col: str = "Destination"
     distance_col: str = "Distance_km"
-    user_agent: str = "jxxthomson@gmail.com"
-    provider: str = "nominatim"  # or "opencage"
+    user_agent: str = "perigon-distance-calculator"
     api_key: str | None = None
     cache_file: str = ".distance_cache.json"
     only_sheets: Tuple[str, ...] = ()
@@ -71,7 +69,6 @@ class Config:
     min_delay: float = 1.0
     max_retries: int = 2
     error_wait: float = 2.0
-    insecure_ssl: bool = False
 
 
 def parse_args() -> Config:
@@ -97,17 +94,11 @@ def parse_args() -> Config:
     parser.add_argument(
         "--user-agent",
         default="perigon-distance-calculator",
-        help="Custom user agent for Nominatim (required by OSM policy)",
-    )
-    parser.add_argument(
-        "--provider",
-        choices=["nominatim", "opencage"],
-        default="nominatim",
-        help="Geocoding provider (default: nominatim; use opencage with API key for reliability)",
+        help="Custom user agent string for OpenCage",
     )
     parser.add_argument(
         "--api-key",
-        help="API key for provider (read from OPENCAGE_API_KEY env var if not provided)",
+        help="API key for OpenCage (read from OPENCAGE_API_KEY env var if not provided)",
     )
     parser.add_argument(
         "--cache-file",
@@ -141,12 +132,6 @@ def parse_args() -> Config:
         default=2.0,
         help="Seconds to wait between retries after an error (default: 2.0)",
     )
-    parser.add_argument(
-        "--insecure-ssl",
-        action="store_true",
-        help="Skip SSL certificate verification for geocoding (not recommended).",
-    )
-
     args = parser.parse_args()
 
     input_path = os.path.abspath(args.input)
@@ -163,7 +148,6 @@ def parse_args() -> Config:
         dest_col=args.dest_col,
         distance_col=args.distance_col,
         user_agent=args.user_agent,
-        provider=args.provider,
         api_key=args.api_key,
         cache_file=os.path.abspath(args.cache_file),
         only_sheets=tuple(s.strip() for s in args.only_sheets.split(",")) if args.only_sheets else (),
@@ -171,7 +155,6 @@ def parse_args() -> Config:
         min_delay=args.min_delay,
         max_retries=args.max_retries,
         error_wait=args.error_wait,
-        insecure_ssl=args.insecure_ssl,
     )
 
 
@@ -187,21 +170,28 @@ def geocode_city(
         return None
 
     raw = name.strip()
-    key = raw.lower()
-    if key in INVALID_TOKENS:
+    key_normalized = raw.lower()
+    if key_normalized in INVALID_TOKENS:
         if debug:
             print(f"         [skip] '{raw}' treated as missing")
         return None
-    corrected = COMMON_CORRECTIONS.get(key, raw)
-    key_cache = corrected.lower()
+    corrected = COMMON_CORRECTIONS.get(key_normalized, raw)
+
+    # Build a cache key that includes provider/bias context to avoid reusing
+    # results from runs with different country bias.
+    cache_key_parts = [corrected.lower()]
+    if geocode_kwargs:
+        for k, v in sorted(geocode_kwargs.items()):
+            cache_key_parts.append(f"{k}={v}")
+    cache_key = "|".join(cache_key_parts)
 
     if corrected != raw and debug:
         print(f"         [normalize] '{raw}' -> '{corrected}'")
 
-    if key_cache in cache:
+    if cache_key in cache:
         if debug:
-            print(f"         [cache hit] '{corrected}' -> {cache[key_cache]}")
-        return cache[key_cache]
+            print(f"         [cache hit] '{corrected}' -> {cache[cache_key]}")
+        return cache[cache_key]
 
     if debug:
         print(f"         [geocode] '{corrected}' ...")
@@ -217,61 +207,56 @@ def geocode_city(
         return None
 
     coords = (location.latitude, location.longitude)
-    cache[key_cache] = coords
+    cache[cache_key] = coords
     if debug:
         print(f"         [geocode] '{corrected}' -> {coords}")
     return coords
 
 
-def compute_distance(
+def compute_distance_pair(
     row,
     cfg: Config,
     geocode_fn,
     cache: Dict[str, Tuple[float, float]],
-    geocode_kwargs: Dict[str, Any] | None = None,
+    bias_plan: Tuple[Tuple[str, Dict[str, Any], float | None], ...],
 ):
+    """
+    Try geocoding both endpoints under each bias in order.
+    bias_plan: sequence of (label, geocode_kwargs, high_distance_threshold_or_None)
+    Returns (result, flag)
+      result: distance float or error token
+      flag: "" or diagnostic string
+    """
     start = row.get(cfg.start_col)
     dest = row.get(cfg.dest_col)
 
     if not isinstance(start, str) or not isinstance(dest, str) or not start.strip() or not dest.strip():
-        return ERR_MISSING_VALUE
+        return ERR_MISSING_VALUE, "MISSING_VALUE"
 
-    try:
-        coords1 = geocode_city(start, geocode_fn, cache, cfg.debug_geocode, geocode_kwargs)
-        coords2 = geocode_city(dest, geocode_fn, cache, cfg.debug_geocode, geocode_kwargs)
-        if coords1 is None or coords2 is None:
-            return ERR_GEOCODE_FAIL
-        dist = round(geodesic(coords1, coords2).kilometers, 3)
-        if cfg.debug_geocode:
-            print(f"         [distance] {start} -> {dest}: {dist} km")
-        return dist
-    except (GeocoderTimedOut, GeocoderServiceError):
-        return ERR_GEOCODE_FAIL
-    except Exception:
-        return ERR_LOOKUP_EXCEPTION
+    for label, kwargs, high_thresh in bias_plan:
+        coords1 = geocode_city(start, geocode_fn, cache, cfg.debug_geocode, kwargs)
+        coords2 = geocode_city(dest, geocode_fn, cache, cfg.debug_geocode, kwargs)
+        if coords1 and coords2:
+            dist = round(geodesic(coords1, coords2).kilometers, 3)
+            if high_thresh and dist > high_thresh:
+                if cfg.debug_geocode:
+                    print(f"         [flag {label}] {start}->{dest} = {dist} km exceeds {high_thresh}")
+                return dist, "CHECK_DISTANCE_HIGH"
+            if cfg.debug_geocode:
+                print(f"         [distance {label}] {start} -> {dest}: {dist} km")
+            return dist, ""
+    return ERR_GEOCODE_FAIL, "GEOCODE_FAIL"
 
 
 def build_geocoder(cfg: Config):
-    """Return a rate-limited geocode callable based on provider."""
-    ssl_context = build_ssl_context(cfg)
-
-    if cfg.provider == "opencage":
-        geocoder = OpenCage(
-            api_key=cfg.api_key,
-            timeout=5,
-            user_agent=cfg.user_agent,
-            ssl_context=ssl_context,
-        )
-        return RateLimiter(
-            geocoder.geocode,
-            min_delay_seconds=cfg.min_delay,
-            max_retries=cfg.max_retries,
-            error_wait_seconds=cfg.error_wait,
-            swallow_exceptions=True,  # return None instead of raising on HTTP errors
-        )
-
-    # Default: public Nominatim (may be blocked; requires user_agent and politeness)
-    geocoder = Nominatim(user_agent=cfg.user_agent, timeout=5, ssl_context=ssl_context)
+    """Return a rate-limited geocode callable using OpenCage only."""
+    ssl_context = build_ssl_context()
+    geocoder = OpenCage(
+        api_key=cfg.api_key,
+        timeout=5,
+        user_agent=cfg.user_agent,
+        ssl_context=ssl_context,
+    )
     return RateLimiter(
         geocoder.geocode,
         min_delay_seconds=cfg.min_delay,
@@ -281,10 +266,7 @@ def build_geocoder(cfg: Config):
     )
 
 
-def build_ssl_context(cfg: Config):
-    """Build an SSL context honoring certifi and --insecure-ssl."""
-    if cfg.insecure_ssl:
-        return ssl._create_unverified_context()
+def build_ssl_context():
     if certifi:
         return ssl.create_default_context(cafile=certifi.where())
     return ssl.create_default_context()
@@ -316,36 +298,27 @@ def process_workbook(cfg: Config) -> None:
             print(f"[3/4] Processing sheet '{sheet_name}' with {proc_rows}/{total_rows} row(s){' (debug limited)' if debug_row_limit else ''}")
 
             # Sheet-specific geocode bias and outlier thresholds
-            geocode_kwargs: Dict[str, Any] = {}
-            outlier_threshold_km = None
+            bias_plan: Tuple[Tuple[str, Dict[str, Any], float | None], ...]
             if sheet_name.lower() == "uniquetrains":
-                # Bias train geocoding toward UK to disambiguate short-haul European routes
-                if cfg.provider == "opencage":
-                    geocode_kwargs["countrycode"] = "gb"
-                else:
-                    geocode_kwargs["country_codes"] = "gb"
-                outlier_threshold_km = 800.0  # tighter threshold for UK-centric train trips
+                bias_plan = (
+                    ("GB", {"country": "gb"}, 800.0),          # UK bias, flag >800km
+                    ("IN", {"country": "in"}, 2000.0),        # India bias, flag >2000km
+                    ("EU", {}, 2000.0),                       # fallback Europe/global, flag >2000km
+                )
+            else:
+                bias_plan = (("ANY", {}, None),)
 
             distances = ["DEBUG_SKIPPED" for _ in range(total_rows)] if debug_row_limit else []
             flags = ["DEBUG_SKIPPED" for _ in range(total_rows)] if debug_row_limit else []
 
             for idx, (_, row) in enumerate(df_proc.iterrows(), start=1):
-                result = compute_distance(row, cfg, geocode_fn, cache, geocode_kwargs)
+                result, flag = compute_distance_pair(row, cfg, geocode_fn, cache, bias_plan)
                 if debug_row_limit:
                     distances[idx - 1] = result
+                    flags[idx - 1] = flag
                 else:
                     distances.append(result)
-                # Flag potential outliers for trains
-                if outlier_threshold_km and isinstance(result, (int, float)) and result > outlier_threshold_km:
-                    if debug_row_limit:
-                        flags[idx - 1] = "CHECK_DISTANCE_HIGH"
-                    else:
-                        flags.append("CHECK_DISTANCE_HIGH")
-                else:
-                    if debug_row_limit:
-                        flags[idx - 1] = ""
-                    else:
-                        flags.append("")
+                    flags.append(flag)
                 if idx % 25 == 0 or idx == proc_rows:
                     print(f"       {sheet_name}: {idx}/{proc_rows} rows complete")
                     # brief pause so print buffer flushes in some terminals
@@ -376,9 +349,9 @@ def main():
     load_dotenv()
     cfg = parse_args()
     # pick up API key from env if not provided
-    if cfg.provider == "opencage" and not cfg.api_key:
+    if not cfg.api_key:
         cfg.api_key = os.getenv("OPENCAGE_API_KEY")
-    if cfg.provider == "opencage" and not cfg.api_key:
+    if not cfg.api_key:
         sys.exit("OPENCAGE_API_KEY not set. Provide --api-key or set it in the environment/.env.")
     try:
         process_workbook(cfg)
