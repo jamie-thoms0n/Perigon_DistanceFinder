@@ -51,6 +51,9 @@ COMMON_CORRECTIONS = {
     "mumabi": "mumbai",
 }
 
+# Tokens that should be treated as missing and not sent to the geocoder.
+INVALID_TOKENS = {"", ".", "-", "n/a", "na", "nan", "none", "null"}
+
 
 @dataclass
 class Config:
@@ -172,13 +175,23 @@ def parse_args() -> Config:
     )
 
 
-def geocode_city(name: Any, geocode_fn, cache: Dict[str, Tuple[float, float]], debug: bool):
+def geocode_city(
+    name: Any,
+    geocode_fn,
+    cache: Dict[str, Tuple[float, float]],
+    debug: bool,
+    geocode_kwargs: Dict[str, Any] | None = None,
+):
     """Return (lat, lon) for a city name or raise/return None."""
     if not isinstance(name, str) or not name.strip():
         return None
 
     raw = name.strip()
     key = raw.lower()
+    if key in INVALID_TOKENS:
+        if debug:
+            print(f"         [skip] '{raw}' treated as missing")
+        return None
     corrected = COMMON_CORRECTIONS.get(key, raw)
     key_cache = corrected.lower()
 
@@ -193,7 +206,7 @@ def geocode_city(name: Any, geocode_fn, cache: Dict[str, Tuple[float, float]], d
     if debug:
         print(f"         [geocode] '{corrected}' ...")
     try:
-        location = geocode_fn(corrected)
+        location = geocode_fn(corrected, **(geocode_kwargs or {}))
     except Exception as exc:
         if debug:
             print(f"         [geocode] '{corrected}' exception: {exc}")
@@ -210,7 +223,13 @@ def geocode_city(name: Any, geocode_fn, cache: Dict[str, Tuple[float, float]], d
     return coords
 
 
-def compute_distance(row, cfg: Config, geocode_fn, cache: Dict[str, Tuple[float, float]]):
+def compute_distance(
+    row,
+    cfg: Config,
+    geocode_fn,
+    cache: Dict[str, Tuple[float, float]],
+    geocode_kwargs: Dict[str, Any] | None = None,
+):
     start = row.get(cfg.start_col)
     dest = row.get(cfg.dest_col)
 
@@ -218,8 +237,8 @@ def compute_distance(row, cfg: Config, geocode_fn, cache: Dict[str, Tuple[float,
         return ERR_MISSING_VALUE
 
     try:
-        coords1 = geocode_city(start, geocode_fn, cache, cfg.debug_geocode)
-        coords2 = geocode_city(dest, geocode_fn, cache, cfg.debug_geocode)
+        coords1 = geocode_city(start, geocode_fn, cache, cfg.debug_geocode, geocode_kwargs)
+        coords2 = geocode_city(dest, geocode_fn, cache, cfg.debug_geocode, geocode_kwargs)
         if coords1 is None or coords2 is None:
             return ERR_GEOCODE_FAIL
         dist = round(geodesic(coords1, coords2).kilometers, 3)
@@ -248,7 +267,7 @@ def build_geocoder(cfg: Config):
             min_delay_seconds=cfg.min_delay,
             max_retries=cfg.max_retries,
             error_wait_seconds=cfg.error_wait,
-            swallow_exceptions=False,
+            swallow_exceptions=True,  # return None instead of raising on HTTP errors
         )
 
     # Default: public Nominatim (may be blocked; requires user_agent and politeness)
@@ -258,7 +277,7 @@ def build_geocoder(cfg: Config):
         min_delay_seconds=cfg.min_delay,
         max_retries=cfg.max_retries,
         error_wait_seconds=cfg.error_wait,
-        swallow_exceptions=False,
+        swallow_exceptions=True,  # return None instead of raising on HTTP errors
     )
 
 
@@ -290,18 +309,52 @@ def process_workbook(cfg: Config) -> None:
         df_out = df.copy()
         if cfg.start_col in df_out.columns and cfg.dest_col in df_out.columns:
             total_rows = len(df_out)
-            print(f"[3/4] Processing sheet '{sheet_name}' with {total_rows} row(s)")
-            distances = []
-            for idx, (_, row) in enumerate(df_out.iterrows(), start=1):
-                result = compute_distance(row, cfg, geocode_fn, cache)
-                distances.append(result)
-                if idx % 25 == 0 or idx == total_rows:
-                    print(f"       {sheet_name}: {idx}/{total_rows} rows complete")
+            # For debug runs, cap processing to avoid long waits
+            debug_row_limit = 50 if cfg.debug_geocode else None
+            df_proc = df_out if not debug_row_limit else df_out.head(debug_row_limit)
+            proc_rows = len(df_proc)
+            print(f"[3/4] Processing sheet '{sheet_name}' with {proc_rows}/{total_rows} row(s){' (debug limited)' if debug_row_limit else ''}")
+
+            # Sheet-specific geocode bias and outlier thresholds
+            geocode_kwargs: Dict[str, Any] = {}
+            outlier_threshold_km = None
+            if sheet_name.lower() == "uniquetrains":
+                # Bias train geocoding toward UK to disambiguate short-haul European routes
+                if cfg.provider == "opencage":
+                    geocode_kwargs["countrycode"] = "gb"
+                else:
+                    geocode_kwargs["country_codes"] = "gb"
+                outlier_threshold_km = 800.0  # tighter threshold for UK-centric train trips
+
+            distances = ["DEBUG_SKIPPED" for _ in range(total_rows)] if debug_row_limit else []
+            flags = ["DEBUG_SKIPPED" for _ in range(total_rows)] if debug_row_limit else []
+
+            for idx, (_, row) in enumerate(df_proc.iterrows(), start=1):
+                result = compute_distance(row, cfg, geocode_fn, cache, geocode_kwargs)
+                if debug_row_limit:
+                    distances[idx - 1] = result
+                else:
+                    distances.append(result)
+                # Flag potential outliers for trains
+                if outlier_threshold_km and isinstance(result, (int, float)) and result > outlier_threshold_km:
+                    if debug_row_limit:
+                        flags[idx - 1] = "CHECK_DISTANCE_HIGH"
+                    else:
+                        flags.append("CHECK_DISTANCE_HIGH")
+                else:
+                    if debug_row_limit:
+                        flags[idx - 1] = ""
+                    else:
+                        flags.append("")
+                if idx % 25 == 0 or idx == proc_rows:
+                    print(f"       {sheet_name}: {idx}/{proc_rows} rows complete")
                     # brief pause so print buffer flushes in some terminals
                     time.sleep(0.01)
                 if cfg.debug_geocode:
                     print(f"       [row {idx}] start='{row.get(cfg.start_col)}' dest='{row.get(cfg.dest_col)}' -> {result}")
             df_out[cfg.distance_col] = distances
+            if sheet_name.lower() == "uniquetrains":
+                df_out["Distance_flag"] = flags
             print(f"       Done: {sheet_name}")
         else:
             # Mark the issue so the user sees the problem but keep processing other sheets.
