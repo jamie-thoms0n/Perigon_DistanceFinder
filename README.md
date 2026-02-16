@@ -197,4 +197,8 @@ The new file appears beside your input, e.g., input `/Users/you/Desktop/Trips.xl
 - **Cache**: `.distance_cache.json` in the project folder (safe to delete if it grows; it will be recreated).  
 - **Config/keys**: `.env` in the project folder (ignored by git).
 
-If you hit a roadblock, copy the exact error message and we can troubleshoot it together.
+---
+
+## Credits & Copyright
+Developed by Jamie Thomson (Jamie.wlt@outlook.com). Please reach out with any problems.
+Copyright © Perigon Partners. All rights reserved.
